@@ -11,11 +11,14 @@
 #include "core/common/query_requests.h"
 #include "core/include/ert.h"
 #include "core/include/xclerr_int.h"
-#include <sys/syscall.h>
-#include <algorithm>
-#include <libgen.h>
-#include <limits.h>
+
 #include <dlfcn.h>
+#include <libgen.h>
+#include <linux/limits.h>
+#include <sys/syscall.h>
+
+#include <algorithm>
+#include <climits>
 #include <sstream>
 
 namespace {
@@ -23,7 +26,7 @@ namespace {
 namespace query = xrt_core::query;
 using key_type = query::key_type;
 
-std::string
+static std::string
 get_shim_lib_path()
 {
     Dl_info info;
@@ -36,7 +39,7 @@ get_shim_lib_path()
     return {};
 }
 
-std::string
+static std::string
 get_shim_data_dir()
 {
   return get_shim_lib_path() + "/../share/amdxdna/";
@@ -385,7 +388,8 @@ struct context_health_info {
     xrt_core::query::context_health_info::smi_context_health val{};
     val.ctx_id = entry.context_id;
     val.pid = entry.pid;
-    val.health_data_v1 = new_entry;
+    val.health_data_raw.resize(sizeof(ert_ctx_health_data_v1));
+    memcpy(val.health_data_raw.data(), &new_entry, sizeof(new_entry));
     return val;
   }
   using result_type = std::any;
@@ -899,16 +903,16 @@ struct archive_path
       case xrt_core::smi::smi_hardware_config::hardware_type::stxB0:
       case xrt_core::smi::smi_hardware_config::hardware_type::stxH:
       case xrt_core::smi::smi_hardware_config::hardware_type::krk1:
-        return std::string(get_shim_data_dir() + "bins/xrt_smi_strx.a");
+        return std::string("amdxdna/bins/xrt_smi_strx.a");
       case xrt_core::smi::smi_hardware_config::hardware_type::phx:
-        return std::string(get_shim_data_dir() + "bins/xrt_smi_phx.a");
+        return std::string("amdxdna/bins/xrt_smi_phx.a");
       case xrt_core::smi::smi_hardware_config::hardware_type::npu3_f1:
       case xrt_core::smi::smi_hardware_config::hardware_type::npu3_f2:
       case xrt_core::smi::smi_hardware_config::hardware_type::npu3_f3:
       case xrt_core::smi::smi_hardware_config::hardware_type::npu3_B01:
       case xrt_core::smi::smi_hardware_config::hardware_type::npu3_B02:
       case xrt_core::smi::smi_hardware_config::hardware_type::npu3_B03:
-        return std::string(get_shim_data_dir() + "bins/xrt_smi_npu3.a");
+        return std::string("amdxdna/bins/xrt_smi_npu3.a");
       default:
         throw xrt_core::error("Unsupported hardware type");
       }
@@ -1200,6 +1204,64 @@ struct resource_info
     info_items[4].data_uint64 = resource_info.npu_task_curr;
 
     return info_items;
+  }
+};
+
+struct aie_coredump
+{
+  using result_type = std::vector<char>;
+
+  static std::any
+  get(const xrt_core::device* /*device*/, key_type key)
+  {
+    throw xrt_core::query::no_such_key(key, "Not implemented");
+  }
+
+  static result_type
+  get(const xrt_core::device* device, key_type key, const std::any& args_any)
+  {
+    if (key != key_type::aie_coredump)
+      throw xrt_core::query::no_such_key(key, "Not implemented");
+
+    const auto& aie_coredump_args = std::any_cast<const query::aie_coredump::args&>(args_any);
+
+    // Calculate buffer size: (sum of all row_counts) * num_cols * 1MB
+    auto aie_stats = xrt_core::device_query<xrt_core::query::aie_tiles_stats>(device);
+    auto total_rows = aie_stats.core_rows + aie_stats.mem_rows + aie_stats.shim_rows;
+    auto num_cols = aie_stats.cols;
+    auto num_tiles = total_rows * num_cols;
+    std::vector<char> payload(num_tiles * 1024 * 1024);
+
+    // Driver expects config struct at the beginning of the buffer
+    amdxdna_drm_aie_coredump *dump = reinterpret_cast<amdxdna_drm_aie_coredump *>(payload.data());
+    dump->context_id = aie_coredump_args.context_id;
+    dump->pid = aie_coredump_args.pid;
+
+    amdxdna_drm_get_array arg = {
+      .param = DRM_AMDXDNA_AIE_COREDUMP,
+      .element_size = static_cast<uint32_t>(payload.size()),
+      .num_element = 1,
+      .buffer = reinterpret_cast<uintptr_t>(payload.data())
+    };
+
+    auto& pci_dev_impl = get_pcidev_impl(device);
+    try {
+      pci_dev_impl.drv_ioctl(shim_xdna::drv_ioctl_cmd::get_info_array, &arg);
+    } catch (const xrt_core::system_error& e) {
+      if (e.get_code() == -ENOSPC) {
+        payload.resize(arg.element_size);
+        dump = reinterpret_cast<amdxdna_drm_aie_coredump *>(payload.data());
+        dump->context_id = aie_coredump_args.context_id;
+        dump->pid = aie_coredump_args.pid;
+        arg.buffer = reinterpret_cast<uintptr_t>(payload.data());
+        arg.element_size = static_cast<uint32_t>(payload.size());
+        pci_dev_impl.drv_ioctl(shim_xdna::drv_ioctl_cmd::get_info_array, &arg);
+      } else {
+        throw;
+      }
+    }
+
+    return payload;
   }
 };
 
@@ -1614,6 +1676,7 @@ initialize_query_table()
   emplace_func1_request<query::xrt_smi_lists,                  xrt_smi_lists>();
   emplace_func1_request<query::firmware_version,               firmware_version>();
   emplace_func1_request<query::sub_device_path,                sub_device_path>();
+  emplace_func1_request<query::aie_coredump,                   aie_coredump>();
 }
 
 struct X { X() { initialize_query_table(); }};
